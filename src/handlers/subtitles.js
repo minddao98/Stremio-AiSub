@@ -80,6 +80,114 @@ function shortKey(v) {
   }
 }
 
+function parsePositiveIntEnv(name, fallback) {
+  const parsed = Number.parseInt(process.env[name], 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const DEFAULT_SUBTITLE_HANG_GUARD_MS = 60 * 1000;
+const SUBTITLE_ROUTE_FALLBACK_TIMEOUT_MS = parsePositiveIntEnv('SUBTITLE_ROUTE_FALLBACK_TIMEOUT_MS', DEFAULT_SUBTITLE_HANG_GUARD_MS);
+const SUBTITLE_CACHE_PHASE_TIMEOUT_MS = parsePositiveIntEnv('SUBTITLE_CACHE_PHASE_TIMEOUT_MS', DEFAULT_SUBTITLE_HANG_GUARD_MS);
+const SUBTITLE_SEARCH_HARD_TIMEOUT_MS = parsePositiveIntEnv('SUBTITLE_SEARCH_HARD_TIMEOUT_MS', DEFAULT_SUBTITLE_HANG_GUARD_MS);
+const SUBTITLE_SEARCH_STALE_GRACE_MS = parsePositiveIntEnv('SUBTITLE_SEARCH_STALE_GRACE_MS', 5000);
+
+function resolveConfiguredSubtitleProviderTimeoutMs(config) {
+  const seconds = Number.parseInt(config?.subtitleProviderTimeout, 10);
+  const normalizedSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 12;
+  return normalizedSeconds * 1000;
+}
+
+function createTimeoutBudget(timeoutMs) {
+  const normalizedTimeoutMs = Number(timeoutMs);
+  if (!Number.isFinite(normalizedTimeoutMs) || normalizedTimeoutMs <= 0) {
+    return null;
+  }
+  return {
+    startedAt: Date.now(),
+    deadlineAt: Date.now() + normalizedTimeoutMs,
+    timeoutMs: normalizedTimeoutMs
+  };
+}
+
+function getTimeoutBudgetRemainingMs(budget, phaseTimeoutMs) {
+  const normalizedPhaseTimeoutMs = Number(phaseTimeoutMs);
+  if (!budget || !Number.isFinite(normalizedPhaseTimeoutMs) || normalizedPhaseTimeoutMs <= 0) {
+    return normalizedPhaseTimeoutMs;
+  }
+  const remainingMs = budget.deadlineAt - Date.now();
+  return Math.max(1, Math.min(normalizedPhaseTimeoutMs, remainingMs));
+}
+
+function createTimeoutError(label, timeoutMs) {
+  const error = new Error(`${label} timed out after ${timeoutMs}ms`);
+  error.code = 'ETIMEDOUT';
+  error.timeoutMs = timeoutMs;
+  return error;
+}
+
+function withTimeout(promiseOrFn, timeoutMs, label) {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return typeof promiseOrFn === 'function' ? Promise.resolve().then(promiseOrFn) : Promise.resolve(promiseOrFn);
+  }
+
+  let timeoutId;
+  const operation = typeof promiseOrFn === 'function' ? Promise.resolve().then(promiseOrFn) : Promise.resolve(promiseOrFn);
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(createTimeoutError(label, timeoutMs)), timeoutMs);
+    timeoutId.unref?.();
+  });
+
+  return Promise.race([operation, timeoutPromise])
+    .finally(() => clearTimeout(timeoutId));
+}
+
+async function withFallbackTimeout(promiseOrFn, timeoutMs, fallbackValue, label) {
+  try {
+    return await withTimeout(promiseOrFn, timeoutMs, label);
+  } catch (error) {
+    if (error?.code === 'ETIMEDOUT') {
+      log.warn(() => `[${label}] Timed out after ${timeoutMs}ms; continuing with fallback`);
+      return typeof fallbackValue === 'function' ? fallbackValue() : fallbackValue;
+    }
+    throw error;
+  }
+}
+
+function markPartialProviderResults(results) {
+  if (Array.isArray(results) && results.__partialProviderResults !== true) {
+    Object.defineProperty(results, '__partialProviderResults', {
+      value: true,
+      enumerable: false,
+      configurable: true
+    });
+  }
+  return results;
+}
+
+function emptyPartialProviderResults() {
+  return markPartialProviderResults([]);
+}
+
+function createFallbackLocalSubtitleHashLookup({ videoId = '', streamFilename = '', stremioHash = '' } = {}) {
+  const normalizedVideoId = String(videoId || '').trim();
+  const normalizedFilename = String(streamFilename || '').trim();
+  const normalizedStremioHash = String(stremioHash || '').trim();
+  const filenameDerivedHash = normalizedFilename ? deriveVideoHash(normalizedFilename, normalizedVideoId) : '';
+  const fallbackVideoHash = normalizedVideoId ? deriveVideoHash('', normalizedVideoId) : '';
+  const associationSeedHashes = [...new Set([normalizedStremioHash, filenameDerivedHash].filter(Boolean))];
+  const directHashes = [...new Set([...associationSeedHashes, fallbackVideoHash].filter(Boolean))];
+
+  return {
+    primaryVideoHash: filenameDerivedHash || normalizedStremioHash || fallbackVideoHash,
+    filenameDerivedHash,
+    fallbackVideoHash,
+    associationSeedHashes,
+    directHashes,
+    lookupHashes: directHashes,
+    recentActivity: null
+  };
+}
+
 function normalizeProviderApiKey(value) {
   if (value === undefined || value === null) return '';
   const normalized = String(value).trim();
@@ -1717,7 +1825,12 @@ scheduleBackgroundInterval(() => {
 // If cache has fewer results, we skip it and do a fresh search
 const MIN_CACHED_SUBTITLES_THRESHOLD = 3;
 
-async function deduplicateSearch(key, fn) {
+async function deduplicateSearch(key, fn, options = {}) {
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 0;
+  const staleInFlightMs = Number(options.staleInFlightMs) > 0
+    ? Number(options.staleInFlightMs)
+    : (timeoutMs > 0 ? timeoutMs + SUBTITLE_SEARCH_STALE_GRACE_MS : SUBTITLE_SEARCH_HARD_TIMEOUT_MS + SUBTITLE_SEARCH_STALE_GRACE_MS);
+
   // Check completed results cache first (persistent cache)
   const cachedResult = subtitleSearchResultsCache.get(key);
   if (cachedResult) {
@@ -1734,14 +1847,34 @@ async function deduplicateSearch(key, fn) {
   // Check in-flight requests (prevents duplicate API calls for concurrent requests)
   const cached = inFlightSearches.get(key);
   if (cached) {
-    log.debug(() => `[Dedup] Subtitle search already in flight: ${shortKey(key)}`);
-    return cached.promise;
+    const ageMs = cached.startedAt ? Date.now() - cached.startedAt : 0;
+    if (staleInFlightMs > 0 && ageMs > staleInFlightMs) {
+      log.warn(() => `[Dedup] Dropping stale subtitle search in flight after ${ageMs}ms: ${shortKey(key)}`);
+      inFlightSearches.delete(key);
+    } else {
+      log.debug(() => `[Dedup] Subtitle search already in flight: ${shortKey(key)}`);
+      return cached.promise;
+    }
   }
 
   log.debug(() => `[Dedup] Processing new subtitle search: ${shortKey(key)}`);
-  const promise = fn();
+  const startedAt = Date.now();
+  const rawPromise = Promise.resolve().then(fn);
+  const promise = timeoutMs > 0
+    ? withTimeout(rawPromise, timeoutMs, `Subtitle search ${shortKey(key)}`)
+      .catch(error => {
+        if (error?.code !== 'ETIMEDOUT') throw error;
+        log.warn(() => `[Dedup] Subtitle search timed out after ${timeoutMs}ms: ${shortKey(key)}`);
+        if (typeof options.onTimeout === 'function') {
+          try { options.onTimeout(error); } catch (_) { }
+        }
+        if (typeof options.timeoutFallback === 'function') return options.timeoutFallback(error);
+        if (options.timeoutFallback !== undefined) return options.timeoutFallback;
+        throw error;
+      })
+    : rawPromise;
 
-  inFlightSearches.set(key, { promise });
+  inFlightSearches.set(key, { promise, startedAt });
 
   try {
     const result = await promise;
@@ -1758,7 +1891,10 @@ async function deduplicateSearch(key, fn) {
     }
     return result;
   } finally {
-    inFlightSearches.delete(key);
+    const current = inFlightSearches.get(key);
+    if (current?.promise === promise) {
+      inFlightSearches.delete(key);
+    }
   }
 }
 
@@ -1775,7 +1911,14 @@ async function collectProviderSearchResults(searchTasks, skippedProviders = [], 
     let timeoutFired = false;
 
     const wrappedPromises = searchTasks.map(task =>
-      task.promise.then(result => {
+      Promise.resolve(task.promise).then(result => {
+        if (!timeoutFired) {
+          collectedResults.push(result);
+        }
+        resolvedCount++;
+        return result;
+      }).catch(error => {
+        const result = { provider: task.provider, results: [], error };
         if (!timeoutFired) {
           collectedResults.push(result);
         }
@@ -1784,15 +1927,18 @@ async function collectProviderSearchResults(searchTasks, skippedProviders = [], 
       })
     );
 
+    let timeoutId;
     const timeoutPromise = new Promise(resolve => {
-      setTimeout(() => {
+      timeoutId = setTimeout(() => {
         timeoutFired = true;
         resolve('timeout');
       }, orchestrationTimeoutMs);
+      timeoutId.unref?.();
     });
 
     const allCompletedPromise = Promise.all(wrappedPromises).then(() => 'completed');
     const winner = await Promise.race([allCompletedPromise, timeoutPromise]);
+    clearTimeout(timeoutId);
 
     if (winner === 'timeout') {
       providerResults = [...collectedResults];
@@ -1809,8 +1955,10 @@ async function collectProviderSearchResults(searchTasks, skippedProviders = [], 
   }
 
   let subtitles = [];
+  let providerErrorCount = 0;
   for (const result of providerResults) {
     if (result.error) {
+      providerErrorCount++;
       log.warn(() => [`[${logContext}] ${result.provider} search failed:`, result.error.message]);
     } else {
       log.debug(() => `[${logContext}] Found ${result.results.length} subtitles from ${result.provider}`);
@@ -1821,6 +1969,10 @@ async function collectProviderSearchResults(searchTasks, skippedProviders = [], 
   if (skippedProviders.length > 0) {
     const skippedNames = skippedProviders.map(s => s.provider).join(', ');
     log.info(() => `[${logContext}] Skipped ${skippedProviders.length} unhealthy provider(s): ${skippedNames}`);
+  }
+
+  if (providerErrorCount > 0 || skippedProviders.length > 0) {
+    partialProviderResults = true;
   }
 
   if (partialProviderResults) {
@@ -2562,6 +2714,10 @@ function createSubtitleHandler(config) {
         return { subtitles: [] };
       }
 
+      const routeFallbackBudget = createTimeoutBudget(SUBTITLE_ROUTE_FALLBACK_TIMEOUT_MS);
+      const configuredProviderTimeoutMs = resolveConfiguredSubtitleProviderTimeoutMs(config);
+      const providerRequestTimeoutMs = Math.max(6000, configuredProviderTimeoutMs - 2000);
+
       const { type, id, extra } = args;
 
       // Block known bogus Stremio internal UI requests (e.g. "Stream and Refresh" button)
@@ -2663,13 +2819,13 @@ function createSubtitleHandler(config) {
             videoHash: videoHashForActivity,
             stremioHash: realStremioHash
           });
-          await persistLocalHashAssociations({
+          await withFallbackTimeout(() => persistLocalHashAssociations({
             configHash,
             videoId: id,
             streamFilename,
             derivedVideoHash: videoHashForActivity,
             stremioHash: realStremioHash
-          });
+          }), getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_CACHE_PHASE_TIMEOUT_MS), [], 'Subtitles local hash association persistence');
 
           // Persist stremioHash ↔ derivedHash mapping so SMDB can find subtitles
           // stored under either hash even after server restarts (stream activity is in-memory only)
@@ -2735,9 +2891,8 @@ function createSubtitleHandler(config) {
         filename: streamFilename,
         // Flag for SCS to know if hash matching is possible
         _isRealStremioHash: hasRealStremioHash,
-        // Provider timeout from config (subtract 2s buffer for orchestration overhead)
-        // Default to 10s (12s config default - 2s buffer) if not configured
-        providerTimeout: Math.max(6, ((config.subtitleProviderTimeout || 12) - 2)) * 1000
+        // Provider timeout from installed config, with a 2s orchestration buffer.
+        providerTimeout: providerRequestTimeoutMs
       };
 
       // Get user config hash for cache isolation
@@ -2748,7 +2903,12 @@ function createSubtitleHandler(config) {
 
       const cacheIdComponent = getVideoCacheIdComponent(videoInfo);
       const subtitleSearchRevisionKey = `${CACHE_PREFIXES.SUBTITLE_SEARCH_REV}${userHash}`;
-      const subtitleSearchRevision = Math.max(0, await getCounter(subtitleSearchRevisionKey));
+      const subtitleSearchRevision = Math.max(0, await withFallbackTimeout(
+        () => getCounter(subtitleSearchRevisionKey),
+        getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_CACHE_PHASE_TIMEOUT_MS),
+        0,
+        'Subtitle search revision lookup'
+      ));
       const streamContextKey = buildSubtitleSearchContextKey({
         streamFilename,
         videoHash: hasRealStremioHash ? extra.videoHash : '',
@@ -2761,6 +2921,11 @@ function createSubtitleHandler(config) {
 
       // Collect subtitles from all enabled providers with deduplication
       let openSubsAuthFailed = false; // track OpenSubtitles auth failures to append UX hint entries later
+      const providerSearchHardTimeoutMs = Math.max(
+        configuredProviderTimeoutMs,
+        getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_SEARCH_HARD_TIMEOUT_MS)
+      );
+      const providerSearchStaleInFlightMs = providerSearchHardTimeoutMs + SUBTITLE_SEARCH_STALE_GRACE_MS;
       const foundSubtitles = await deduplicateSearch(dedupKey, async () => {
         // Parallelize all provider searches using Promise.allSettled for better performance
         // This reduces search time from (OpenSubtitles + SubDL + SubSource) sequential
@@ -2978,11 +3143,15 @@ function createSubtitleHandler(config) {
           log.debug(() => '[Subtitles] Subs.ro provider is disabled');
         }
 
-        const orchestrationTimeoutMs = (config.subtitleProviderTimeout || 12) * 1000;
+        const orchestrationTimeoutMs = configuredProviderTimeoutMs;
         return collectProviderSearchResults(searchTasks, skippedProviders, {
           logContext: 'Subtitles',
           orchestrationTimeoutMs
         });
+      }, {
+        timeoutMs: providerSearchHardTimeoutMs,
+        staleInFlightMs: providerSearchStaleInFlightMs,
+        timeoutFallback: emptyPartialProviderResults
       });
 
       // Future providers can be added here
@@ -3098,12 +3267,18 @@ function createSubtitleHandler(config) {
         || config.fileTranslationEnabled === true
         || config.syncSubtitlesEnabled === true;
 
-      const localHashLookup = await resolveLocalSubtitleHashes({
+      const localHashContext = {
         configHash: config.__configHash || '',
         videoId: id,
         streamFilename,
         stremioHash: hasRealStremioHash ? extra.videoHash : ''
-      });
+      };
+      const localHashLookup = await withFallbackTimeout(
+        () => resolveLocalSubtitleHashes(localHashContext),
+        getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_CACHE_PHASE_TIMEOUT_MS),
+        () => createFallbackLocalSubtitleHashLookup(localHashContext),
+        'Subtitles local hash lookup'
+      );
       const primaryVideoHash = localHashLookup.primaryVideoHash;
       const videoHashes = localHashLookup.lookupHashes;
       if (videoHashes.length > localHashLookup.directHashes.length) {
@@ -3137,7 +3312,12 @@ function createSubtitleHandler(config) {
           );
         }
         // Execute all preloads in parallel
-        const preloadResults = await Promise.all(preloadPromises);
+        const preloadResults = await withFallbackTimeout(
+          () => Promise.all(preloadPromises),
+          getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_CACHE_PHASE_TIMEOUT_MS),
+          [],
+          'Subtitles xEmbed cache preload'
+        );
         for (const result of preloadResults) {
           if (result.type === 'original') {
             embeddedOriginalsByHash.set(result.hash, result.data);
@@ -3286,15 +3466,20 @@ function createSubtitleHandler(config) {
         }
 
         // Execute all lookups in parallel
-        const syncResults = await Promise.all(
-          syncLookups.map(({ hash, lang, candidate }) =>
-            syncCache.getSyncedSubtitles(hash, candidate)
-              .then(subs => ({ hash, lang, candidate, subs: subs || [] }))
-              .catch(error => {
-                log.error(() => [`[Subtitles] Failed to get xSync entries for ${lang} (hash=${hash}):`, error.message]);
-                return { hash, lang, candidate, subs: [] };
-              })
-          )
+        const syncResults = await withFallbackTimeout(
+          () => Promise.all(
+            syncLookups.map(({ hash, lang, candidate }) =>
+              syncCache.getSyncedSubtitles(hash, candidate)
+                .then(subs => ({ hash, lang, candidate, subs: subs || [] }))
+                .catch(error => {
+                  log.error(() => [`[Subtitles] Failed to get xSync entries for ${lang} (hash=${hash}):`, error.message]);
+                  return { hash, lang, candidate, subs: [] };
+                })
+            )
+          ),
+          getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_CACHE_PHASE_TIMEOUT_MS),
+          [],
+          'Subtitles xSync cache lookup'
         );
 
         // Process results
@@ -3366,15 +3551,20 @@ function createSubtitleHandler(config) {
           }
         }
 
-        const autoResults = await Promise.all(
-          autoLookups.map(({ hash, lang, candidate }) =>
-            autoSubCache.getAutoSubtitles(hash, candidate)
-              .then(subs => ({ hash, lang, candidate, subs: subs || [] }))
-              .catch(error => {
-                log.error(() => [`[Subtitles] Failed to get Auto entries for ${lang} (hash=${hash}):`, error.message]);
-                return { hash, lang, candidate, subs: [] };
-              })
-          )
+        const autoResults = await withFallbackTimeout(
+          () => Promise.all(
+            autoLookups.map(({ hash, lang, candidate }) =>
+              autoSubCache.getAutoSubtitles(hash, candidate)
+                .then(subs => ({ hash, lang, candidate, subs: subs || [] }))
+                .catch(error => {
+                  log.error(() => [`[Subtitles] Failed to get Auto entries for ${lang} (hash=${hash}):`, error.message]);
+                  return { hash, lang, candidate, subs: [] };
+                })
+            )
+          ),
+          getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_CACHE_PHASE_TIMEOUT_MS),
+          [],
+          'Subtitles Auto cache lookup'
         );
 
         const autoByHashLang = new Map();
@@ -3505,7 +3695,12 @@ function createSubtitleHandler(config) {
           // Expand via persistent hash mappings (stremioHash ↔ derivedHash stored in Redis)
           // This ensures subtitles uploaded under one hash are found even when only the other is available
           const expansionPromises = [...associationSeedHashes].map(h => smdbCache.getAssociatedHashes(h));
-          const expansionResults = await Promise.all(expansionPromises);
+          const expansionResults = await withFallbackTimeout(
+            () => Promise.all(expansionPromises),
+            getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_CACHE_PHASE_TIMEOUT_MS),
+            [],
+            'Subtitles SMDB hash expansion'
+          );
           const smdbHashes = [...new Set([
             ...directHashes,
             ...expansionResults.flat().filter(Boolean)
@@ -3515,7 +3710,12 @@ function createSubtitleHandler(config) {
             log.debug(() => `[Subtitles] SMDB hash expansion: ${directHashes.size} direct → ${smdbHashes.length} total hashes`);
           }
 
-          const smdbSubs = await smdbCache.listSubtitlesMultiHash(smdbHashes);
+          const smdbSubs = await withFallbackTimeout(
+            () => smdbCache.listSubtitlesMultiHash(smdbHashes),
+            getTimeoutBudgetRemainingMs(routeFallbackBudget, SUBTITLE_CACHE_PHASE_TIMEOUT_MS),
+            [],
+            'Subtitles SMDB list lookup'
+          );
           for (const sub of smdbSubs) {
             const langName = getLanguageName(sub.languageCode) || sub.languageCode;
             smdbEntries.push({

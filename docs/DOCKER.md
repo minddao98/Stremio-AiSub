@@ -201,6 +201,8 @@ docker run -d \
 - Redis password: set `REDIS_PASSWORD_FILE` (for example `/app/keys/.redis-password`) to auto-generate and persist a strong Redis password. If `REDIS_PASSWORD` is set, that value is used instead and written to the password file. Ensure Redis is configured to read the same file; the provided `docker-compose.yaml` handles this via the shared `keys` volume.
 - Ports: container listens on `7001` by default; override with `PORT` env and matching host mapping.
 - `TRUST_PROXY`: set to `1` when running behind a reverse proxy (nginx, Cloudflare, etc.) so Express reads the real client IP from `X-Forwarded-For`. Defaults to `false` (safe for direct exposure). Accepts numeric depth, boolean, or named values (`loopback`, `linklocal`, `uniquelocal`).
+- OpenSubtitles Auth in multi-instance deployments requires shared Redis coordination. Keep all SubMaker replicas on the same Redis/key prefix so JWT cache, login singleflight, and login backoff are shared. Advanced tuning variables: `OPENSUBTITLES_LOGIN_MIN_INTERVAL_MS`, `OPENSUBTITLES_LOGIN_BACKOFF_MIN_MS`, `OPENSUBTITLES_LOGIN_BACKOFF_MAX_MS`, `OPENSUBTITLES_LOGIN_LOCK_TTL_MS`, `OPENSUBTITLES_AUTH_FAILURE_TTL_MS`.
+- Subtitle provider searches use the timeout saved in each installed config. Last-resort route/cache hang guards default to 60s and can be tuned with `SUBTITLE_ROUTE_FALLBACK_TIMEOUT_MS`, `SUBTITLE_CACHE_PHASE_TIMEOUT_MS`, `SUBTITLE_SEARCH_HARD_TIMEOUT_MS`, and `SUBTITLE_SEARCH_STALE_GRACE_MS`.
 
 ## Troubleshooting
 - Check app logs: `docker-compose logs -f submaker`
