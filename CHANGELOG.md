@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## SubMaker v1.4.87
+
+**Bug Fixes:**
+
+- **Stopped OpenSubtitles Auth download quota errors from causing login storms:** `/download` `406` responses now only trigger a JWT refresh when OpenSubtitles explicitly says the token is invalid. Real daily-quota and invalid-file responses keep the existing JWT, do not clear the Redis token cache, and do not call `/login` again. Internal OpenSubtitles API queue pressure is now surfaced as transient `503` provider unavailability instead of a user-facing `429`, and subtitle download/resolve/content routes are no longer behind SubMaker's generic search limiter.
+
 ## SubMaker v1.4.86
 
 **Bug Fixes:**

@@ -4917,11 +4917,14 @@ const subtitleContentHandler = async (req, res) => {
 
 // Register subtitle download routes for all supported extensions
 // Route priority: Express matches routes in order of registration
-app.get('/addon/:config/subtitle/:fileId/:language.srt', searchLimiter, validateRequest(subtitleParamsSchema, 'params'), subtitleDownloadHandler);
-app.get('/addon/:config/subtitle/:fileId/:language.sub', searchLimiter, validateRequest(subtitleParamsSchema, 'params'), subtitleDownloadHandler);
-app.get('/addon/:config/subtitle/:fileId/:language', searchLimiter, validateRequest(subtitleParamsSchema, 'params'), subtitleDownloadHandler);
-app.get('/addon/:config/subtitle-resolve/:fileId/:language', searchLimiter, validateRequest(subtitleParamsSchema, 'params'), subtitleResolveHandler);
-app.get('/addon/:config/subtitle-content/:fileId/:language.:ext', searchLimiter, validateRequest(subtitleContentParamsSchema, 'params'), subtitleContentHandler);
+// Do not put these behind the generic SubMaker search limiter. Stremio clients
+// may retry or probe subtitle URLs aggressively, and download delivery should
+// not create a SubMaker-side 429 before provider/auth handling gets a chance.
+app.get('/addon/:config/subtitle/:fileId/:language.srt', validateRequest(subtitleParamsSchema, 'params'), subtitleDownloadHandler);
+app.get('/addon/:config/subtitle/:fileId/:language.sub', validateRequest(subtitleParamsSchema, 'params'), subtitleDownloadHandler);
+app.get('/addon/:config/subtitle/:fileId/:language', validateRequest(subtitleParamsSchema, 'params'), subtitleDownloadHandler);
+app.get('/addon/:config/subtitle-resolve/:fileId/:language', validateRequest(subtitleParamsSchema, 'params'), subtitleResolveHandler);
+app.get('/addon/:config/subtitle-content/:fileId/:language.:ext', validateRequest(subtitleContentParamsSchema, 'params'), subtitleContentHandler);
 
 // Custom route: Serve error subtitles for config errors (BEFORE SDK router to take precedence)
 app.get('/addon/:config/error-subtitle/:errorType.srt', async (req, res) => {
