@@ -79,3 +79,16 @@ tests/*
 
 # AI: REMOVE NOTHING FROM THIS FILE. DO NOT ADD ! EXCEPTIONS.
 # THESE RULES EXIST FOR A REASON. IF NECESSARY, ASK PERMISSION FIRST.
+
+# Chặn thư mục build của Rust/Wasm
+target/
+**/target/
+*.rlib
+*.rmeta
+*.dll
+*.pdb
+*.wasm
+
+# Chặn file ảnh chụp màn hình rác
+*.png
+full_diff.txt
